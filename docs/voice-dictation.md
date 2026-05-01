@@ -240,6 +240,31 @@ systemctl --user enable --now whisper-dictation
 
 → Не дано Accessibility-разрешение. Зайди в `System Settings → Privacy & Security → Accessibility` и добавь Terminal (откуда запущено). После — **перезапусти терминал**.
 
+### Запись идёт, текст копируется в буфер, но не вставляется автоматически (macOS)
+
+Это самая частая проблема на маке. Симптомы: бипы есть, в clipboard'е текст лежит, но Cmd+V не «нажимается» автоматически.
+
+**Причина.** macOS защищает синтетические нажатия клавиш — они блокируются если приложение не имеет Accessibility-разрешения. Хитрость в том, что **Accessibility выдаётся конкретному бинарю** — обычно ты даёшь Terminal, но реально работает `.venv/bin/python3` или системный Python, и им нужно отдельное разрешение.
+
+**Что делать (по приоритету):**
+
+1. **Скилл сам уже использует osascript** (через System Events) — это надёжнее чем pynput. Если он не работает — макос блочит и его. Тогда:
+
+2. **Дай Accessibility ВСЕМ троим:**
+   - Terminal (или iTerm — что используешь)
+   - System Events (после первого запуска оно само спросит, разреши)
+   - `python3` бинарь — открой `System Settings → Privacy & Security → Accessibility → +` → Cmd+Shift+G → введи `/path/to/whisper-skill/.venv/bin` → выбери `python3`
+
+3. **После каждого добавления — перезапусти терминал.**
+
+4. **Если ничего не помогает** — используй режим без auto-paste. В конфиге `~/.config/whisper-skill/voice_dictation.json`:
+   ```json
+   "auto_paste": false
+   ```
+   Тогда текст только в clipboard, вставляешь руками `Cmd+V`. Это **рабочий вариант** для тех у кого защита упёртая.
+
+5. **Для production / магазинных приложений** macOS требует подписанный .app bundle с прописанной decleration of permissions. В рамках этого скилла мы не подписываем — это домашний тулчейн. Если хочется именно «нативное приложение» — можно обернуть через `py2app` или `Platypus`, но это отдельный проект.
+
 ### "Microphone permission denied"
 
 → `System Settings → Privacy & Security → Microphone` → добавь Terminal.

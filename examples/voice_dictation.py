@@ -175,7 +175,31 @@ def copy_to_clipboard(text: str) -> None:
 
 
 def paste_from_clipboard() -> None:
-    """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win)."""
+    """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win).
+
+    На macOS приоритет — osascript: он работает через System Events, для которого
+    разрешение Accessibility даётся один раз на Terminal/iTerm, и срабатывает
+    надёжно. pynput-путь оставлен как fallback (на случай отсутствия osascript
+    или сломанного System Events).
+
+    На Linux/Windows используется pynput напрямую.
+    """
+    # macOS: предпочитаем osascript (надёжнее с защитой Accessibility)
+    if platform.system() == "Darwin":
+        try:
+            subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to keystroke "v" using command down'],
+                check=True, capture_output=True, timeout=2,
+            )
+            return
+        except subprocess.CalledProcessError as e:
+            stderr = (e.stderr or b"").decode(errors="replace")
+            logging.warning(f"osascript paste failed ({stderr.strip()}), trying pynput fallback")
+        except Exception as e:
+            logging.warning(f"osascript paste failed: {e}, trying pynput fallback")
+
+    # Fallback и основной путь для Linux/Windows
     try:
         from pynput.keyboard import Controller, Key
         kb = Controller()
@@ -184,7 +208,10 @@ def paste_from_clipboard() -> None:
             kb.press("v")
             kb.release("v")
     except Exception as e:
-        logging.error(f"paste simulation failed: {e}")
+        logging.error(
+            f"paste simulation failed: {e}\n"
+            f"Текст в clipboard — вставь вручную через Cmd+V/Ctrl+V."
+        )
 
 
 def play_beep(frequency: int = 800, duration_ms: int = 80) -> None:

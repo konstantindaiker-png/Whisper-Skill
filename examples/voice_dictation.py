@@ -58,6 +58,8 @@ DEFAULT_CONFIG = {
     "auto_paste": True,                  # вставить через Cmd+V/Ctrl+V после копирования
     "play_sound": True,                  # бипы на старт/стоп
     "show_tray": True,                   # значок в трее (если установлен pystray)
+    "show_cursor_indicator": True,       # мигающая красная точка у курсора во время записи
+    "cursor_indicator_color": "#ef4444", # цвет точки (CSS hex)
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
@@ -230,14 +232,18 @@ def paste_from_clipboard() -> None:
 
 
 def play_beep(frequency: int = 800, duration_ms: int = 80) -> None:
-    """Короткий бип. Тихий, для feedback'а."""
+    """Короткий синтезированный бип через sounddevice. Сохранён для
+    обратной совместимости и для платформ без winsound (Linux/macOS).
+
+    На Windows предпочитай play_beep_system — он громче, гарантированно
+    слышен и не конфликтует с активным sd.InputStream (запись микрофона).
+    """
     try:
         import numpy as np
         import sounddevice as sd
         sample_rate = 44100
         t = np.linspace(0, duration_ms / 1000, int(sample_rate * duration_ms / 1000), False)
         tone = 0.15 * np.sin(2 * np.pi * frequency * t)
-        # fade-in/out для отсутствия щелчков
         fade = int(sample_rate * 0.005)
         envelope = np.ones_like(tone)
         envelope[:fade] = np.linspace(0, 1, fade)
@@ -245,7 +251,141 @@ def play_beep(frequency: int = 800, duration_ms: int = 80) -> None:
         tone = tone * envelope
         sd.play(tone.astype(np.float32), sample_rate, blocking=True)
     except Exception:
-        pass  # неважно — feedback опциональный
+        pass
+
+
+def _make_dual_beep_wav(
+    f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40,
+    sample_rate: int = 22050, vol: float = 0.01,
+    tail_silence_ms: int = 80,
+) -> bytes:
+    """Сгенерировать in-memory WAV с двумя тонами через паузу.
+
+    Возвращает байты PCM-WAV пригодные для winsound.PlaySound(SND_MEMORY).
+
+    tail_silence_ms — хвост тишины после второго тона. Нужен потому, что
+    Windows audio mixer иногда обрезает последние ~30-50ms короткого WAV
+    (артефакт буферизации). Просто добавляем «зазор» из нулей.
+    """
+    import math as _m
+    import struct
+
+    def _tone_samples(freq: int, dur_ms: int) -> list:
+        n = int(sample_rate * dur_ms / 1000)
+        fade_n = max(1, int(sample_rate * 0.015))  # 15ms fade — длинный ramp убирает крякание BT-кодеков на attack
+        out = []
+        two_pi_f = 2.0 * _m.pi * freq
+        for i in range(n):
+            env = 1.0
+            if i < fade_n:
+                env = i / fade_n
+            elif i > n - fade_n:
+                env = max(0.0, (n - i) / fade_n)
+            sample = int(32767 * vol * env * _m.sin(two_pi_f * (i / sample_rate)))
+            out.append(struct.pack("<h", sample))
+        return out
+
+    silence_samples = [b"\x00\x00"] * int(sample_rate * gap_ms / 1000)
+    tail_samples = [b"\x00\x00"] * int(sample_rate * tail_silence_ms / 1000)
+    samples = (
+        _tone_samples(f1, dur_ms) + silence_samples
+        + _tone_samples(f2, dur_ms) + tail_samples
+    )
+    data = b"".join(samples)
+
+    # 16-bit mono PCM WAV header
+    fmt_chunk = struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
+    )
+    data_chunk = struct.pack("<4sI", b"data", len(data)) + data
+    riff = struct.pack("<4sI4s", b"RIFF", 4 + len(fmt_chunk) + len(data_chunk), b"WAVE")
+    return riff + fmt_chunk + data_chunk
+
+
+def _make_single_beep_wav(
+    freq: int = 600, dur_ms: int = 100,
+    sample_rate: int = 22050, vol: float = 0.01,
+    fade_ms: int = 10, tail_silence_ms: int = 80,
+) -> bytes:
+    """Однотоновый WAV. Мягкий, не сливается с речью — для стоп-сигнала."""
+    import math as _m
+    import struct
+
+    n = int(sample_rate * dur_ms / 1000)
+    fade_n = max(1, int(sample_rate * fade_ms / 1000))
+    two_pi_f = 2.0 * _m.pi * freq
+    tone = []
+    for i in range(n):
+        env = 1.0
+        if i < fade_n:
+            env = i / fade_n
+        elif i > n - fade_n:
+            env = max(0.0, (n - i) / fade_n)
+        sample = int(32767 * vol * env * _m.sin(two_pi_f * (i / sample_rate)))
+        tone.append(struct.pack("<h", sample))
+    tail = [b"\x00\x00"] * int(sample_rate * tail_silence_ms / 1000)
+    data = b"".join(tone + tail)
+
+    fmt_chunk = struct.pack(
+        "<4sIHHIIHH",
+        b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
+    )
+    data_chunk = struct.pack("<4sI", b"data", len(data)) + data
+    riff = struct.pack("<4sI4s", b"RIFF", 4 + len(fmt_chunk) + len(data_chunk), b"WAVE")
+    return riff + fmt_chunk + data_chunk
+
+
+# Pre-render the two beep WAVs once at import time — playing them later
+# is then just a fire-and-forget winsound call.
+_BEEP_WAV_START: Optional[bytes] = None
+_BEEP_WAV_STOP: Optional[bytes] = None
+try:
+    _BEEP_WAV_START = _make_dual_beep_wav(700, 900)  # rising
+    _BEEP_WAV_STOP = _make_single_beep_wav(600, 100)
+except Exception:
+    pass
+
+
+def _play_wav_bytes(wav: bytes) -> None:
+    """Проиграть готовые WAV-байты через основную звуковую карту."""
+    if platform.system() == "Windows":
+        try:
+            import winsound
+            winsound.PlaySound(wav, winsound.SND_MEMORY | winsound.SND_NODEFAULT)
+            return
+        except Exception as e:
+            logging.error(f"winsound play failed: {e}")
+
+
+def play_start_beep() -> None:
+    if _BEEP_WAV_START is not None:
+        _play_wav_bytes(_BEEP_WAV_START)
+
+
+def play_stop_beep() -> None:
+    if _BEEP_WAV_STOP is not None:
+        _play_wav_bytes(_BEEP_WAV_STOP)
+
+
+def play_dual_beep(f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40) -> None:
+    """Двутоновый бип на произвольных частотах. Синтезирует WAV каждый раз —
+    использовать только для редких/нестандартных тонов; для обычных
+    старт/стоп есть play_start_beep / play_stop_beep с предрендеренным WAV.
+    """
+    if platform.system() == "Windows":
+        try:
+            _play_wav_bytes(_make_dual_beep_wav(f1, f2, dur_ms, gap_ms))
+            return
+        except Exception as e:
+            logging.error(f"winsound dual beep failed: {e}")
+    try:
+        play_beep(f1, dur_ms)
+        if gap_ms > 0:
+            time.sleep(gap_ms / 1000.0)
+        play_beep(f2, dur_ms)
+    except Exception:
+        pass
 
 
 # ─── Tray icon ──────────────────────────────────────────────────────────────
@@ -316,18 +456,34 @@ def main_loop(cfg: dict):
         return 1
 
     state = State()
+    state_lock = threading.Lock()
     recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"])
     tray = TrayIcon()
     if cfg.get("show_tray"):
         tray.start()
 
+    # Cursor indicator (small blinking dot near the mouse cursor while recording).
+    # Optional — silently disables if Tk unavailable.
+    cursor_ind = None
+    if cfg.get("show_cursor_indicator", True):
+        try:
+            from scripts.cursor_indicator import CursorIndicator
+            cursor_ind = CursorIndicator(color=cfg.get("cursor_indicator_color", "#ef4444"))
+            cursor_ind.start()
+        except Exception as e:
+            logging.error(f"cursor indicator init failed: {e}")
+            cursor_ind = None
+
     def start_recording():
-        if state.is_recording or state.is_transcribing:
-            return
-        state.is_recording = True
+        with state_lock:
+            if state.is_recording or state.is_transcribing:
+                return
+            state.is_recording = True
         tray.set_state("recording")
+        if cursor_ind:
+            cursor_ind.show()
         if cfg.get("play_sound"):
-            threading.Thread(target=lambda: play_beep(900, 60), daemon=True).start()
+            threading.Thread(target=play_start_beep, daemon=True).start()
         try:
             recorder.start()
             print("🎙  Recording... (release hotkey to transcribe)")
@@ -335,16 +491,24 @@ def main_loop(cfg: dict):
             print(f"❌ Recording failed: {e}")
             state.is_recording = False
             tray.set_state("idle")
+            if cursor_ind:
+                cursor_ind.hide()
 
     def stop_and_transcribe():
-        if not state.is_recording:
-            return
-        state.is_recording = False
+        with state_lock:
+            if not state.is_recording:
+                return
+            state.is_recording = False
         tray.set_state("transcribing")
-        if cfg.get("play_sound"):
-            threading.Thread(target=lambda: play_beep(600, 60), daemon=True).start()
+        if cursor_ind:
+            cursor_ind.hide()
 
+        # Сначала закрываем микрофон, потом играем бип. Параллельный запуск
+        # winsound во время stream.close() PortAudio даёт повторное звучание
+        # (наблюдалось 2026-05-01: один вызов PlaySound → два слышимых тона).
         wav_path = recorder.stop()
+        if cfg.get("play_sound"):
+            threading.Thread(target=play_stop_beep, daemon=True).start()
         if not wav_path:
             tray.set_state("idle")
             return

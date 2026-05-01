@@ -39,7 +39,7 @@ from typing import Optional, Tuple
 SIZE = 6                     # window size (square)
 DOT_RADIUS = 1.5             # tiny solid red dot
 OFFSET_X = 10                # cursor → dot offset (right of cursor)
-OFFSET_Y = 6                 # ~middle of arrow cursor height
+OFFSET_Y = 7                 # ~middle of arrow cursor height (slightly lower)
 TRANSPARENT_BG = "#ff00ff"   # transparent-key colour (magenta) on Windows
 DEFAULT_COLOR = "#ef4444"    # red-500
 BLINK_PERIOD_S = 0.6         # one full on/off cycle (caret-style blink)

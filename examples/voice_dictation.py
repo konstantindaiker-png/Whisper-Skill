@@ -430,17 +430,7 @@ class TrayIcon:
             import pystray
             from PIL import Image, ImageDraw
 
-            def _make_image(color: str):
-                img = Image.new("RGB", (64, 64), "white")
-                d = ImageDraw.Draw(img)
-                d.ellipse((8, 8, 56, 56), fill=color)
-                return img
-
-            self._images = {
-                "idle": _make_image("#666666"),
-                "recording": _make_image("#e63946"),
-                "transcribing": _make_image("#f4a261"),
-            }
+            self._images = self._build_images()
             self.icon = pystray.Icon(
                 "voice_dictation",
                 self._images["idle"],
@@ -454,6 +444,38 @@ class TrayIcon:
         except Exception as e:
             logging.info(f"Tray icon disabled: {e}")
 
+    @staticmethod
+    def _build_images():
+        from PIL import Image, ImageDraw
+
+        size = 64
+        # Базовая иконка — assets/icon.png рядом с репо. Если её нет
+        # (минимальная установка) — fallback на серый круг.
+        repo_root = Path(__file__).resolve().parents[1]
+        icon_path = repo_root / "assets" / "icon.png"
+        if icon_path.exists():
+            base = Image.open(icon_path).convert("RGBA").resize((size, size), Image.LANCZOS)
+        else:
+            base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+            d = ImageDraw.Draw(base)
+            d.ellipse((8, 8, 56, 56), fill="#666666")
+
+        def _with_dot(color: Optional[str]):
+            img = base.copy()
+            if color is not None:
+                d = ImageDraw.Draw(img)
+                # Точка-индикатор поверх встроенной красной точки логотипа
+                # (правый нижний угол) — повторяет позицию dot'а возле курсора.
+                d.ellipse((size - 26, size - 26, size - 4, size - 4),
+                          fill=color, outline="white", width=2)
+            return img
+
+        return {
+            "idle": _with_dot(None),
+            "recording": _with_dot("#e63946"),
+            "transcribing": _with_dot("#f4a261"),
+        }
+
     def set_state(self, state: str):
         if not self._ready or not self.icon:
             return
@@ -463,6 +485,41 @@ class TrayIcon:
 
 
 # ─── Hotkey-driven main loop ────────────────────────────────────────────────
+
+
+def _warmup(transcribe_fn, cfg: dict, tray) -> None:
+    """Прогрев модели в фоне — компилирует OV-граф / прогружает веса.
+
+    Без warmup'а первый Ctrl+Alt тратит 5–30 сек на cold start (особенно
+    на OpenVINO + iGPU при первом compile=True). Запись на короткий буфер
+    тишины, результат игнорируем.
+    """
+    try:
+        import wave
+        # 0.5 сек тишины 16k mono int16 — минимум, который не отлетает по VAD
+        sample_rate = 16000
+        silence = b"\x00\x00" * (sample_rate // 2)
+        tmp = Path(tempfile.gettempdir()) / "whisper_skill_warmup.wav"
+        with wave.open(str(tmp), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(silence)
+
+        t0 = time.time()
+        transcribe_fn(
+            str(tmp),
+            language=cfg.get("language"),
+            model_name=cfg.get("model"),
+            backend=cfg.get("backend"),
+            word_timestamps=False,
+            verbose=False,
+        )
+        logging.info(f"warmup done in {time.time() - t0:.1f}s")
+    except Exception as e:
+        # Прогрев — best-effort. Если упал, обычная диктовка продолжит работать
+        # как раньше: просто первый запрос будет холодным.
+        logging.info(f"warmup failed (non-fatal): {e}")
 
 
 @dataclass
@@ -488,6 +545,15 @@ def main_loop(cfg: dict):
     tray = TrayIcon()
     if cfg.get("show_tray"):
         tray.start()
+
+    # Прогрев модели в фоне: первый hotkey-press не должен ждать
+    # компиляцию OpenVINO-графа / загрузку весов faster-whisper.
+    if cfg.get("warmup", True):
+        threading.Thread(
+            target=_warmup,
+            args=(transcribe, cfg, tray),
+            daemon=True,
+        ).start()
 
     # Cursor indicator (small blinking dot near the mouse cursor while recording).
     # Optional — silently disables if Tk unavailable.

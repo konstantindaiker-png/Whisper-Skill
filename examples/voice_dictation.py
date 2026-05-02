@@ -54,7 +54,6 @@ DEFAULT_CONFIG = {
     "ov_device": "GPU",                  # OpenVINO: GPU | NPU | CPU | AUTO
     "sample_rate": 16000,
     "channels": 1,
-    "max_duration_sec": 60,
     "auto_paste": True,                  # вставить через Cmd+V/Ctrl+V после копирования
     "play_sound": True,                  # бипы на старт/стоп
     "show_tray": True,                   # значок в трее (если установлен pystray)
@@ -90,6 +89,124 @@ def load_config(path: Optional[Path] = None) -> dict:
 def write_config(path: Path, cfg: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ─── Available models (OpenVINO cache) ──────────────────────────────────────
+
+
+_MODEL_QUALITY_ORDER = [
+    # Best → worst. Turbo (distilled-decoder) — лучший компромисс скорость/качество,
+    # но чуть слабее int8/int8-sym на сложных кейсах (шум, акцент).
+    # int4 теряет в качестве заметнее всех.
+    "large-v3",
+    "large-v3-int8",
+    "large-v3-int8-sym",
+    "large-v3-turbo",
+    "large-v3-int4",
+    "medium", "small", "base", "tiny",
+]
+
+
+def list_available_ov_models() -> list:
+    """Папки `whisper-*-ov` в ~/.cache/openvino-whisper/ — те, что openvino-
+    backend умеет грузить (см. _transcribe_openvino в common.py).
+    Возвращает model-name'ы в порядке убывания качества (best первый);
+    модели вне whitelist'а уходят в конец alphabetically.
+    """
+    base = Path.home() / ".cache" / "openvino-whisper"
+    if not base.exists():
+        return []
+    found = set()
+    for p in base.iterdir():
+        if p.is_dir() and p.name.startswith("whisper-") and p.name.endswith("-ov"):
+            found.add(p.name[len("whisper-"):-len("-ov")])
+    ordered = [m for m in _MODEL_QUALITY_ORDER if m in found]
+    extras = sorted(found - set(ordered))
+    return ordered + extras
+
+
+# ─── Single-instance lock ───────────────────────────────────────────────────
+
+
+_single_instance_handle = None  # держим ссылку чтобы lock не сборщик мусора убил
+
+
+def acquire_single_instance_lock(timeout_seconds: float = 2.0) -> bool:
+    """Захватить named mutex (Windows) / file lock (Unix). True — захватили.
+    False — другая копия уже работает.
+
+    timeout_seconds покрывает self-restart: старая копия только что вызвала
+    os._exit, новая стартует, ОС ещё не успела освободить lock — повторяем.
+    """
+    global _single_instance_handle
+    deadline = time.monotonic() + timeout_seconds
+
+    if platform.system() == "Windows":
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        while True:
+            handle = kernel32.CreateMutexW(None, True, "WhisperVoiceDictation_SingleInstance")
+            if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+                _single_instance_handle = handle
+                return True
+            kernel32.CloseHandle(handle)
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.15)
+    else:
+        try:
+            import fcntl
+        except ImportError:
+            return True  # нет fcntl — пропускаем lock (Win-вариант покрыт выше)
+        lock_path = Path.home() / ".config" / "whisper-skill" / "voice_dictation.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            fh = open(lock_path, "a+")
+            try:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fh.seek(0); fh.truncate()
+                fh.write(str(os.getpid())); fh.flush()
+                _single_instance_handle = fh
+                return True
+            except (BlockingIOError, OSError):
+                fh.close()
+                if time.monotonic() >= deadline:
+                    return False
+                time.sleep(0.15)
+
+
+def restart_self() -> None:
+    """Завершить текущий процесс и запустить новую копию через VBS launcher.
+    Используется при смене модели через tray-меню."""
+    repo_root = Path(__file__).resolve().parents[1]
+    if platform.system() == "Windows":
+        vbs = repo_root / "launcher" / "voice_dictation_silent.vbs"
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        if vbs.exists():
+            subprocess.Popen(
+                ["wscript.exe", str(vbs)],
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+        else:
+            subprocess.Popen(
+                [sys.executable, "-m", "examples.voice_dictation"],
+                cwd=str(repo_root),
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+    else:
+        subprocess.Popen(
+            [sys.executable, "-m", "examples.voice_dictation"],
+            cwd=str(repo_root),
+            start_new_session=True,
+            close_fds=True,
+        )
+    # os._exit — мгновенный hard exit без atexit/finally; ОС освободит mutex/lock,
+    # новая копия подхватит после retry в acquire_single_instance_lock.
+    os._exit(0)
 
 
 # ─── Setup helper ───────────────────────────────────────────────────────────
@@ -456,24 +573,49 @@ class TrayIcon:
         self.icon = None
         self._ready = False
 
-    def start(self):
+    def start(self, current_model: Optional[str] = None,
+              available_models: Optional[list] = None,
+              on_select_model=None):
+        """current_model / available_models / on_select_model — для подменю
+        "Модель". on_select_model(name) вызывается при клике; обычно делает
+        write_config + restart_self()."""
         try:
             import pystray
             from PIL import Image, ImageDraw
 
             self._images = self._build_images()
+
+            menu_entries = []
+            if available_models:
+                def _make_handler(name):
+                    return lambda icon, item: on_select_model and on_select_model(name)
+
+                def _make_check(name):
+                    return lambda item: current_model == name
+
+                model_items = [
+                    pystray.MenuItem(
+                        m, _make_handler(m),
+                        checked=_make_check(m), radio=True,
+                    )
+                    for m in available_models
+                ]
+                menu_entries.append(
+                    pystray.MenuItem("Model", pystray.Menu(*model_items))
+                )
+
+            menu_entries.append(pystray.MenuItem("Quit", lambda: self.icon.stop()))
+
             self.icon = pystray.Icon(
                 "voice_dictation",
                 self._images["idle"],
                 "Whisper Voice Dictation",
-                menu=pystray.Menu(
-                    pystray.MenuItem("Quit", lambda: self.icon.stop()),
-                ),
+                menu=pystray.Menu(*menu_entries),
             )
             threading.Thread(target=self.icon.run, daemon=True).start()
             self._ready = True
         except Exception as e:
-            logging.info(f"Tray icon disabled: {e}")
+            logging.warning(f"Tray icon disabled: {e}", exc_info=True)
 
     @staticmethod
     def _build_images():
@@ -559,7 +701,7 @@ class State:
     is_transcribing: bool = False
 
 
-def main_loop(cfg: dict):
+def main_loop(cfg: dict, cfg_path: Path):
     from pynput import keyboard
 
     # Lazy-import чтобы не падать на импортов при ошибке отсутствия пакетов
@@ -588,9 +730,28 @@ def main_loop(cfg: dict):
                 "Чтобы включить — поставь mac_low_cpu_mode: false в конфиге."
             )
 
+    def _on_select_model(new_model: str):
+        if new_model == cfg.get("model"):
+            return
+        try:
+            cur = load_config(cfg_path)
+            cur["model"] = new_model
+            write_config(cfg_path, cur)
+        except Exception as e:
+            logging.error(f"failed to write new model to config: {e}")
+            return
+        print(f"🔁 Переключаю модель → {new_model}, перезапуск...")
+        # restart_self спавнит новую копию через VBS launcher и os._exit'ит текущую.
+        # Новая копия дождётся освобождения mutex (retry в acquire_single_instance_lock).
+        restart_self()
+
     tray = TrayIcon()
     if cfg.get("show_tray") and not is_mac_low_cpu:
-        tray.start()
+        tray.start(
+            current_model=cfg.get("model"),
+            available_models=list_available_ov_models(),
+            on_select_model=_on_select_model,
+        )
 
     # Прогрев модели в фоне: первый hotkey-press не должен ждать
     # компиляцию OpenVINO-графа / загрузку весов faster-whisper.
@@ -789,6 +950,37 @@ def _canonical_key(key) -> str:
 # ─── Entry point ────────────────────────────────────────────────────────────
 
 
+_LOG_ROTATE_BYTES = 5 * 1024 * 1024
+
+
+def _attach_log_file(log_path: str, verbose: bool) -> None:
+    """Перенаправить stdout/stderr/logging в файл.
+
+    Нужен и для отладки (видно что транскрибируется), и чтобы под pythonw.exe
+    (autostart) print() не падал молча — там sys.stdout/sys.stderr = None.
+    """
+    expanded = os.path.expandvars(os.path.expanduser(log_path))
+    Path(expanded).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if os.path.getsize(expanded) > _LOG_ROTATE_BYTES:
+            backup = expanded + ".old"
+            try: os.replace(expanded, backup)
+            except OSError: pass
+    except OSError:
+        pass
+    fh = open(expanded, "a", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = fh
+    sys.stderr = fh
+    logging.basicConfig(
+        level=logging.INFO if verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[logging.StreamHandler(fh)],
+        force=True,
+    )
+    from datetime import datetime as _dt
+    fh.write(f"\n--- voice_dictation started {_dt.now().isoformat(timespec='seconds')} ---\n")
+
+
 def main():
     p = argparse.ArgumentParser(description="Push-to-talk голосовая диктовка через Whisper")
     p.add_argument("--config", default=None, help="Путь к JSON-конфигу")
@@ -796,13 +988,30 @@ def main():
     p.add_argument("-v", "--verbose", action="store_true")
     args = p.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO if args.verbose else logging.WARNING,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
     if args.setup:
+        logging.basicConfig(
+            level=logging.INFO if args.verbose else logging.WARNING,
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
         setup_wizard()
+        return 0
+
+    cfg_path = Path(args.config) if args.config else default_config_path()
+    cfg = load_config(cfg_path)
+
+    if cfg.get("log_file"):
+        _attach_log_file(cfg["log_file"], args.verbose)
+    else:
+        logging.basicConfig(
+            level=logging.INFO if args.verbose else logging.WARNING,
+            format="%(asctime)s %(levelname)s %(message)s",
+        )
+
+    # Single-instance: вторая копия (autostart + ярлык, или ручной запуск
+    # поверх работающей) выходит тихо. Retry — на случай self-restart при
+    # переключении модели через tray-меню.
+    if not acquire_single_instance_lock(timeout_seconds=2.0):
+        logging.info("Another voice_dictation instance is already running — exiting silently.")
         return 0
 
     # Fast mode for dictation: greedy decoding, no temperature fallback
@@ -811,15 +1020,10 @@ def main():
     os.environ.setdefault("WHISPER_CONDITION_ON_PREV", "0")
 
     # Apply backend selection from config (must happen before transcribe is imported)
-    cfg_path_for_env = Path(args.config) if args.config else default_config_path()
-    cfg_for_env = load_config(cfg_path_for_env)
-    if cfg_for_env.get("backend"):
-        os.environ["WHISPER_BACKEND"] = cfg_for_env["backend"]
-    if cfg_for_env.get("ov_device"):
-        os.environ["WHISPER_OV_DEVICE"] = cfg_for_env["ov_device"]
-
-    cfg_path = Path(args.config) if args.config else default_config_path()
-    cfg = load_config(cfg_path)
+    if cfg.get("backend"):
+        os.environ["WHISPER_BACKEND"] = cfg["backend"]
+    if cfg.get("ov_device"):
+        os.environ["WHISPER_OV_DEVICE"] = cfg["ov_device"]
 
     # Проверка зависимостей
     missing = []
@@ -851,7 +1055,7 @@ def main():
         if not _check_macos_accessibility():
             return 1
 
-    return main_loop(cfg)
+    return main_loop(cfg, cfg_path)
 
 
 def _check_macos_accessibility() -> bool:

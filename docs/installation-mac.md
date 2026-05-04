@@ -4,12 +4,18 @@
 
 ## Apple Silicon (M-чипы) — рекомендованный путь
 
+> ⚠️ **Используй Python 3.12** (не 3.14). На 3.14 нет wheels для mlx-whisper / numba / torch (на момент 2026-05). На 3.10–3.13 всё работает.
+
 ```bash
 # 1) Homebrew если ещё нет
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
-# 2) ffmpeg + python
+# 2) ffmpeg + python 3.12 + (опционально) tk для cursor_indicator
 brew install ffmpeg python@3.12
+# Если планируешь использовать show_cursor_indicator на не-Mac:
+# brew install python-tk@3.12
+# (на macOS cursor_indicator всё равно отключён из-за Tk thread-safety —
+# подробнее в docs/voice-dictation.md → секция "macOS: процесс падает")
 
 # 3) venv для проекта
 mkdir -p ~/whisper-projects && cd ~/whisper-projects

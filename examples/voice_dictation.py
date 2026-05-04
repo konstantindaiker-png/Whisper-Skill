@@ -63,6 +63,12 @@ DEFAULT_CONFIG = {
     "log_file": None,                    # путь к файлу лога или null = stdout
     "trim_silence_ms": 200,              # обрезать тишину в начале/конце записи
     "min_duration_ms": 300,              # игнорировать слишком короткие записи (промахи кнопкой)
+    # macOS-специфика: pystray/Tk известно жрут CPU в фоне на macOS
+    # (NSRunLoop в non-main thread + Tk thread-safety). Этот флаг автоматически
+    # отключает show_tray и show_cursor_indicator на macOS, оставляя CLI-вывод
+    # как единственный feedback. Если хочешь tray на Mac на свой страх и риск —
+    # поставь false (тогда show_tray/show_cursor_indicator будут уважаться).
+    "mac_low_cpu_mode": True,
 }
 
 
@@ -485,14 +491,30 @@ def main_loop(cfg: dict):
     state = State()
     state_lock = threading.Lock()
     recorder = AudioRecorder(cfg["sample_rate"], cfg["channels"])
+
+    # macOS low-CPU mode: pystray в фоне и Tk у нас вызывают серьёзный
+    # idle-CPU на маке (наблюдалось ~90% на M-чипе). Дефолтно отключаем оба
+    # GUI-feedback'а на Mac. Юзер видит CLI-stdout (Recording/Transcribing/✓).
+    is_mac_low_cpu = (
+        platform.system() == "Darwin"
+        and cfg.get("mac_low_cpu_mode", True)
+    )
+    if is_mac_low_cpu:
+        if cfg.get("show_tray") or cfg.get("show_cursor_indicator"):
+            logging.info(
+                "macOS: tray и cursor_indicator отключены ради экономии CPU. "
+                "Чтобы включить — поставь mac_low_cpu_mode: false в конфиге."
+            )
+
     tray = TrayIcon()
-    if cfg.get("show_tray"):
+    if cfg.get("show_tray") and not is_mac_low_cpu:
         tray.start()
 
     # Cursor indicator (small blinking dot near the mouse cursor while recording).
-    # Optional — silently disables if Tk unavailable.
+    # Optional — silently disables if Tk unavailable. На macOS всегда no-op
+    # (см. scripts/cursor_indicator.py — Tk thread-safety issue).
     cursor_ind = None
-    if cfg.get("show_cursor_indicator", True):
+    if cfg.get("show_cursor_indicator", True) and not is_mac_low_cpu:
         try:
             from scripts.cursor_indicator import CursorIndicator
             cursor_ind = CursorIndicator(color=cfg.get("cursor_indicator_color", "#ef4444"))
@@ -701,13 +723,83 @@ def main():
             __import__(mod)
         except ImportError:
             missing.append(mod)
+    # tkinter нужен только если включён cursor_indicator на не-Mac
+    if cfg.get("show_cursor_indicator", True) and platform.system() != "Darwin":
+        try:
+            __import__("tkinter")
+        except ImportError:
+            print("⚠ tkinter не найден — cursor_indicator не будет работать.", file=sys.stderr)
+            print("  Mac:    brew install python-tk@3.12", file=sys.stderr)
+            print("  Linux:  sudo apt install python3-tk", file=sys.stderr)
+            print("  Windows: переустанови Python и отметь 'tcl/tk and IDLE'", file=sys.stderr)
+            print("  Или просто отключи в конфиге: show_cursor_indicator: false\n", file=sys.stderr)
     if missing:
         print(f"❌ Не установлены пакеты: {missing}", file=sys.stderr)
         print(f"\nПоставь:")
         print(f"  pip install {' '.join(missing)} pystray Pillow")
         return 1
 
+    # macOS Accessibility check — без него глобальный hotkey не сработает,
+    # но pynput даёт только WARNING в stderr и не падает. Пользователь
+    # думает что всё сломано. Явно проверяем + открываем системные настройки.
+    if platform.system() == "Darwin":
+        if not _check_macos_accessibility():
+            return 1
+
     return main_loop(cfg)
+
+
+def _check_macos_accessibility() -> bool:
+    """Проверить что процессу выдан Accessibility-permission на macOS.
+
+    Использует CoreFoundation/ApplicationServices через ctypes. Если
+    permission не выдан — печатает чёткую инструкцию и автоматически
+    открывает соответствующий раздел System Settings. Возвращает False
+    если permission не выдан (caller должен exit'нуть с этим кодом).
+    """
+    try:
+        import ctypes
+        from ctypes import c_void_p, c_bool
+
+        # AXIsProcessTrustedWithOptions из ApplicationServices framework
+        ApplicationServices = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        # Берём без options → не показываем системный prompt (он мигает и пропадает,
+        # пользователю всё равно не понятно что делать)
+        ApplicationServices.AXIsProcessTrusted.restype = c_bool
+        trusted = ApplicationServices.AXIsProcessTrusted()
+    except Exception as e:
+        # Если не удалось проверить — не блокируем запуск (пусть pynput сам разберётся)
+        logging.debug(f"AX trust check failed: {e}")
+        return True
+
+    if trusted:
+        return True
+
+    print("\n" + "─" * 60, file=sys.stderr)
+    print("❌ macOS Accessibility permission не выдан", file=sys.stderr)
+    print("─" * 60, file=sys.stderr)
+    print(
+        f"\nЭтому Python-бинарю нужен Accessibility доступ для глобального hotkey:\n"
+        f"  {sys.executable}\n",
+        file=sys.stderr,
+    )
+    print("Что делать:", file=sys.stderr)
+    print("  1. Сейчас откроется System Settings → Privacy → Accessibility", file=sys.stderr)
+    print("  2. Нажми + → Cmd+Shift+G → вставь путь выше → выбери python3", file=sys.stderr)
+    print("  3. Включи галочку напротив добавленного python3", file=sys.stderr)
+    print("  4. Запусти voice_dictation заново\n", file=sys.stderr)
+
+    try:
+        subprocess.Popen([
+            "open",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ])
+    except Exception:
+        pass
+
+    return False
 
 
 if __name__ == "__main__":

@@ -9,8 +9,15 @@ Tk запускается в собственном daemon-thread'е (Tk не л
 потоков). Внешний код шлёт команды через queue.Queue, GUI вычитывает их
 через Tk.after(). Зависимости: только stdlib.
 
+⚠️ macOS: НЕ ПОДДЕРЖИВАЕТСЯ. macOS Tk требует чтобы Tk() был на main thread
+(NSApplication привязан к main thread'у). Создание Tk в фоне даёт:
+    NSInvalidArgumentException '-[NSApplication macOSVersion]: unrecognized selector'
+с последующим крашем процесса. С KeepAlive=true в LaunchAgent — бесконечный
+краш-цикл. Поэтому на macOS CursorIndicator.start() — no-op.
+Пользователи Mac получают visual feedback через tray icon (TrayIcon).
+
 Windows-only нюанс: позиция курсора берётся через GetCursorPos из user32.
-На Linux/Mac fallback на pyautogui.position(), если pyautogui установлен.
+На Linux fallback на pyautogui.position(), если pyautogui установлен.
 
 Использование:
     from scripts.cursor_indicator import CursorIndicator
@@ -89,21 +96,38 @@ class CursorIndicator:
         self._ready = threading.Event()
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True, name="cursor-indicator")
+        # macOS не поддерживает Tk в non-main thread (NSInvalidArgumentException).
+        # Класс молча превращается в no-op чтобы caller-код можно было оставить
+        # без условий — show()/hide()/stop() просто ничего не делают.
+        self._disabled_on_mac = platform.system() == "Darwin"
 
     # ─── Public API ─────────────────────────────────────────────────────
 
     def start(self) -> None:
+        if self._disabled_on_mac:
+            logging.info(
+                "cursor_indicator: skipped on macOS (Tk thread-safety issue). "
+                "Visual feedback available via show_tray=true."
+            )
+            self._ready.set()
+            return
         self._thread.start()
         self._ready.wait(timeout=2.0)
 
     def stop(self) -> None:
+        if self._disabled_on_mac:
+            return
         self._cmd_queue.put(("__quit__", None))
         self._stopped.wait(timeout=1.0)
 
     def show(self) -> None:
+        if self._disabled_on_mac:
+            return
         self._cmd_queue.put(("show", None))
 
     def hide(self) -> None:
+        if self._disabled_on_mac:
+            return
         self._cmd_queue.put(("hide", None))
 
     # ─── Internals (Tk thread only) ─────────────────────────────────────

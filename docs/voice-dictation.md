@@ -76,12 +76,33 @@ python -m examples.voice_dictation
 // Универсальный
 "hotkey": "<ctrl>+<shift>+<space>"
 
-// Под клавишу на правой стороне (для leftie)
-"hotkey": "<right_alt>+<space>"
+// Однокнопочные модификаторы (для миграции с OpenWispr / Wispr Flow / Superwhisper)
+"hotkey": "<alt_r>"        // Right Option (OpenWispr default) ⭐ самый популярный
+"hotkey": "<alt_l>"        // Left Option
+"hotkey": "<cmd_r>"        // Right Command (Wispr Flow стандарт)
 
-// Однокнопочный (требует доступности)
+// Под клавишу на правой стороне (для leftie)
+"hotkey": "<alt_r>+<space>"
+
+// Однокнопочные функциональные клавиши
 "hotkey": "<f9>"
+"hotkey": "<f13>"          // на Mac часто свободна
 ```
+
+> 💡 **pynput использует имена `alt_l` / `alt_r` / `cmd_l` / `cmd_r` / `ctrl_l` / `ctrl_r`** —
+> с подчёркиванием, не `right_alt` / `left_alt`. Если поставишь невалидное имя
+> в конфиге, hotkey просто не сработает (без понятной ошибки).
+
+### Миграция с OpenWispr / Wispr Flow / Superwhisper
+
+Если переходишь с другого инструмента — у них стандартные хоткеи:
+
+| С чего | Хоткей | Конфиг для нашего скилла |
+|---|---|---|
+| **OpenWispr** | Right Option (без модификаторов) | `"hotkey": "<alt_r>", "mode": "toggle"` |
+| **Wispr Flow** | Right Command | `"hotkey": "<cmd_r>", "mode": "toggle"` |
+| **Superwhisper** | F-key configurable | `"hotkey": "<f5>", "mode": "ptt"` |
+| **Aqua Voice** | Globe/Fn key | `"hotkey": "<f6>", "mode": "ptt"` |
 
 ## Permissions
 
@@ -191,6 +212,14 @@ Auto-detect языка. Whisper сам понимает RU/EN. Чуть медл
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- ⭐ ВАЖНО: без PYTHONUNBUFFERED логи копятся в буфер
+         и в StandardOutPath ничего не пишется пока не накопится 4-8KB.
+         Из-за этого кажется что скрипт не запустился. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+    </dict>
     <key>StandardOutPath</key>
     <string>/tmp/whisper_dictation.log</string>
     <key>StandardErrorPath</key>
@@ -268,6 +297,38 @@ systemctl --user enable --now whisper-dictation
 ### "Microphone permission denied"
 
 → `System Settings → Privacy & Security → Microphone` → добавь Terminal.
+
+### macOS: высокий CPU в idle (~70-90%) даже когда ничего не записываю
+
+Это известная проблема комбо `pystray` (NSRunLoop в non-main thread) + `pynput` (CGEventTap) на macOS. С версии **2026-05-04** скилл по дефолту включает `mac_low_cpu_mode: true` в конфиге, который автоматически отключает `show_tray` и `show_cursor_indicator` на маке. Если у тебя старый конфиг — добавь руками:
+
+```json
+{
+  "mac_low_cpu_mode": true,
+  "show_tray": false,
+  "show_cursor_indicator": false
+}
+```
+
+Визуальный feedback на маке остаётся через CLI-stdout (`Recording...`, `Transcribing...`, `✓`). Если очень хочется иконку в трее — поставь `mac_low_cpu_mode: false` (на свой страх и риск, CPU вырастет).
+
+### macOS: процесс падает с `NSInvalidArgumentException` после старта
+
+Старый баг (фикс выпущен 2026-05-04). С `show_cursor_indicator: true` на macOS Tk создавал окно из non-main thread → краш в Tcl/Tk 9.0. Текущая версия скилла **автоматически отключает** cursor_indicator на macOS (`scripts/cursor_indicator.py` → no-op на Mac). Обнови:
+
+```bash
+cd whisper-skill
+git pull
+```
+
+### macOS: launchd респаунит процесс в бесконечный краш-цикл
+
+Связано с предыдущим багом — `KeepAlive=true` + cursor_indicator краш = вечный респаун. После `git pull` (фикс выше) и **перезапуска LaunchAgent**:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.whisper.dictation.plist
+launchctl load ~/Library/LaunchAgents/com.whisper.dictation.plist
+```
 
 ### Текст вставился, но без пробела
 

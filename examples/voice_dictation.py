@@ -528,6 +528,9 @@ def _macos_type_unicode(text: str) -> None:
     Quartz недоступен — caller fallback'ается на pynput."""
     import Quartz
 
+    n = len(text)
+    print(f"⌨  Typing {n} chars via Quartz CGEvent...", flush=True)
+    t0 = time.time()
     tap = Quartz.kCGHIDEventTap
     for ch in text:
         ev_down = Quartz.CGEventCreateKeyboardEvent(None, 0, True)
@@ -536,6 +539,7 @@ def _macos_type_unicode(text: str) -> None:
         ev_up = Quartz.CGEventCreateKeyboardEvent(None, 0, False)
         Quartz.CGEventKeyboardSetUnicodeString(ev_up, len(ch), ch)
         Quartz.CGEventPost(tap, ev_up)
+    print(f"⌨  Typed {n} chars in {time.time()-t0:.2f}s", flush=True)
 
 
 def paste_from_clipboard(text: Optional[str] = None) -> None:
@@ -867,6 +871,98 @@ class TrayIcon:
             self.icon.icon = img
 
 
+# ─── macOS: pynput CGEventTap stability patch ───────────────────────────────
+#
+# Корневая проблема. pynput на macOS слушает клавиатуру через
+# CGEventTapCreate(kCGSessionEventTap). У ОС жёсткий порог: если callback не
+# отрабатывает за ~1 секунду, tap навсегда отключается с событием
+# kCGEventTapDisabledByTimeout (0xFFFFFFFE). Pynput это событие НЕ
+# обрабатывает — CFRunLoopRun продолжает крутиться, listener.running остаётся
+# True, но ни одного клавиатурного события больше не приходит.
+#
+# Симптом: после нескольких удачных диктовок хоткей перестаёт реагировать.
+# Лечилось только kill процесса. Этот патч делает 2 вещи:
+#   1. Перехватывает kCGEventTapDisabledBy* и зовёт CGEventTapEnable(tap, True)
+#      — оживляет tap автоматически.
+#   2. Пропускает на этапе диспатча события с is_injected=True (наши
+#      собственные Quartz CGEvent при печати кириллицы) — снимает шторм
+#      из ~350 событий за каждую вставку, который и провоцирует timeout.
+#
+# Идемпотентен — повторный вызов только обновляет on_recovery hook.
+
+
+def _patch_pynput_macos_stability(on_recovery: Optional[Callable[[], None]] = None) -> None:
+    if platform.system() != "Darwin":
+        return
+    try:
+        from pynput._util.darwin import ListenerMixin
+        import Quartz
+    except Exception as e:
+        logging.warning(f"pynput macOS stability patch skipped: {e}")
+        return
+
+    if getattr(ListenerMixin, "_stability_patched", False):
+        ListenerMixin._on_tap_recovery = on_recovery
+        return
+
+    KCG_TAP_DISABLED_BY_TIMEOUT = 0xFFFFFFFE
+    KCG_TAP_DISABLED_BY_USER = 0xFFFFFFFF
+
+    # Сохраняем tap-handle на self при создании, чтобы re-enable мог его найти
+    _orig_create = ListenerMixin._create_event_tap
+
+    def _create_event_tap_storing(self):
+        tap = _orig_create(self)
+        try:
+            self._tap = tap
+        except Exception:
+            pass
+        return tap
+
+    ListenerMixin._create_event_tap = _create_event_tap_storing
+
+    _orig_handler = ListenerMixin._handler
+
+    def _handler_resilient(self, proxy, event_type, event, refcon):
+        if event_type in (KCG_TAP_DISABLED_BY_TIMEOUT, KCG_TAP_DISABLED_BY_USER):
+            tap = getattr(self, "_tap", None)
+            if tap is not None:
+                try:
+                    Quartz.CGEventTapEnable(tap, True)
+                    reason = "timeout" if event_type == KCG_TAP_DISABLED_BY_TIMEOUT else "user-input"
+                    print(f"⚠ CGEventTap auto-recovered (reason: {reason})", flush=True)
+                except Exception as e:
+                    logging.error(f"CGEventTap re-enable failed: {e}")
+            cb = getattr(ListenerMixin, "_on_tap_recovery", None)
+            if cb:
+                try:
+                    cb()
+                except Exception as e:
+                    logging.debug(f"tap-recovery hook raised: {e}")
+            return event
+
+        try:
+            is_injected = Quartz.CGEventGetIntegerValueField(
+                event, Quartz.kCGEventSourceUnixProcessID
+            ) != 0
+        except Exception:
+            is_injected = False
+
+        if is_injected:
+            if getattr(self, "_intercept", None):
+                try:
+                    return self._intercept(event_type, event)
+                except Exception:
+                    return event
+            return None if getattr(self, "suppress", False) else event
+
+        return _orig_handler(self, proxy, event_type, event, refcon)
+
+    ListenerMixin._handler = _handler_resilient
+    ListenerMixin._stability_patched = True
+    ListenerMixin._on_tap_recovery = on_recovery
+
+
 # ─── Hotkey-driven main loop ────────────────────────────────────────────────
 
 
@@ -910,6 +1006,7 @@ class State:
     is_recording: bool = False
     is_transcribing: bool = False
     last_dictation_at: float = 0.0  # time.time() последней успешной вставки
+    recording_started_at: float = 0.0  # time.time() начала текущей записи (для watchdog-таймаута)
 
 
 def main_loop(cfg: dict, cfg_path: Path):
@@ -1008,6 +1105,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             if state.is_recording or state.is_transcribing:
                 return
             state.is_recording = True
+            state.recording_started_at = time.time()
         tray.set_state("recording")
         if cursor_ind:
             cursor_ind.show()
@@ -1132,29 +1230,178 @@ def main_loop(cfg: dict, cfg_path: Path):
     print(f"\nНажми {hotkey_str} чтобы говорить. Ctrl+C чтобы выйти.\n")
 
     if cfg["mode"] == "ptt":
-        # Push-to-talk: нажал → запись, отпустил → транскрибировать
-        # У pynput GlobalHotKeys работает по нажатию. Для PTT отслеживаем сами через Listener.
+        # Push-to-talk: нажал → запись, отпустил → транскрибировать.
+        #
+        # КРИТИЧНО для macOS: callback'и pynput-listener ДОЛЖНЫ отрабатывать
+        # за < 1 секунды, иначе ОС отключает CGEventTap и хоткей умирает.
+        # Поэтому on_press/on_release делают только мгновенную работу
+        # (set + queue.put), а start_recording/stop_and_transcribe (с их
+        # блокирующим PortAudio init/close) уходят в отдельный worker-thread.
+        import queue as _queue
         keys_needed = _parse_hotkey(hotkey_str)
         currently_pressed = set()
+        action_queue: _queue.Queue = _queue.Queue()
+
+        def _action_worker():
+            while True:
+                action = action_queue.get()
+                if action is None:
+                    return
+                try:
+                    if action == "start":
+                        start_recording()
+                    elif action == "stop":
+                        stop_and_transcribe()
+                except Exception as e:
+                    logging.error(f"dictation action worker error: {e}")
+
+        threading.Thread(target=_action_worker, daemon=True, name="dictation-actions").start()
+
+        # На macOS чиним 2 пробела в pynput: re-enable tap после timeout +
+        # фильтр injected событий (наша собственная печать через CGEvent).
+        # on_recovery вызывается из listener-thread когда tap ожил — стопаем
+        # запись, если она была в процессе (on_release мы могли пропустить).
+        def _on_tap_recovery():
+            if state.is_recording:
+                action_queue.put("stop")
+        _patch_pynput_macos_stability(on_recovery=_on_tap_recovery)
 
         def on_press(key):
-            currently_pressed.add(_canonical_key(key))
-            if keys_needed.issubset(currently_pressed):
-                start_recording()
+            ck = _canonical_key(key)
+            currently_pressed.add(ck)
+            if keys_needed.issubset(currently_pressed) and not state.is_recording:
+                action_queue.put("start")
 
         def on_release(key):
             ck = _canonical_key(key)
-            if ck in keys_needed and state.is_recording:
-                stop_and_transcribe()
+            was_active_combo = ck in keys_needed and state.is_recording
             currently_pressed.discard(ck)
+            if was_active_combo:
+                action_queue.put("stop")
 
-        with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+        def _build_listener():
+            return keyboard.Listener(on_press=on_press, on_release=on_release)
+
+        listener_holder = {"listener": None}
+
+        # Параметры watchdog'а. Интервал короткий: tap-timeout надо ловить за
+        # секунды, а не за 15с — иначе хоткей "мёртв" ощутимо долго.
+        watchdog_interval = cfg.get("watchdog_interval_sec", 5)
+        max_recording_sec = cfg.get("max_recording_sec", 120)
+
+        # macOS: для прямого опроса состояния tap нужен Quartz. На других ОС
+        # tap-health не применим — watchdog работает только как thread-liveness.
+        _wd_quartz = None
+        if platform.system() == "Darwin":
             try:
-                listener.join()
-            except KeyboardInterrupt:
-                pass
+                import Quartz as _wd_quartz  # noqa: N816
+            except Exception as e:
+                logging.warning(f"watchdog: Quartz недоступен, tap-health отключён: {e}")
+                _wd_quartz = None
+
+        def _listener_watchdog():
+            # Три страховки, каждые watchdog_interval секунд:
+            #
+            # (A) Зависшая запись. Если on_release потерян (по любой причине —
+            #     tap-timeout, пропущенное событие, фокус), is_recording
+            #     остаётся True навсегда → классический висяк на "Recording...".
+            #     Никто не держит push-to-talk дольше max_recording_sec —
+            #     значит запись зависла, форсим stop.
+            #
+            # (B) tap-health (macOS, ГЛАВНОЕ). macOS отключает CGEventTap при
+            #     callback >~1с, посылая kCGEventTapDisabledByTimeout. Это
+            #     событие НЕ доходит до pynput._handler надёжно (runloop занят
+            #     зависшим callback'ом) — поэтому monkey-patch на событие в
+            #     проде не срабатывал ни разу. При этом тред жив, running=True,
+            #     так что liveness-проверка (C) тоже слепа. Единственный
+            #     надёжный путь — напрямую спросить CGEventTapIsEnabled и
+            #     re-enable при необходимости.
+            #
+            # (C) Thread-liveness (все ОС). Поток listener'а упал по
+            #     неперехваченной ошибке → пересоздаём.
+            tap_none_warned = False
+            while True:
+                time.sleep(watchdog_interval)
+
+                # (A) зависшая запись
+                if state.is_recording and state.recording_started_at:
+                    held = time.time() - state.recording_started_at
+                    if held > max_recording_sec:
+                        print(
+                            f"⚠ recording stuck for {held:.0f}s (>{max_recording_sec}s), "
+                            f"forcing stop — потерян on_release",
+                            flush=True,
+                        )
+                        action_queue.put("stop")
+
+                lst = listener_holder.get("listener")
+                if lst is None:
+                    continue
+
+                # (B) tap-health (macOS)
+                if _wd_quartz is not None:
+                    tap = getattr(lst, "_tap", None)
+                    if tap is None:
+                        if not tap_none_warned:
+                            logging.warning(
+                                "watchdog: listener._tap отсутствует — "
+                                "monkey-patch не сохранил tap-handle, tap-health недоступен"
+                            )
+                            tap_none_warned = True
+                    else:
+                        try:
+                            enabled = _wd_quartz.CGEventTapIsEnabled(tap)
+                        except Exception as e:
+                            enabled = True  # не смогли проверить — не трогаем
+                            logging.debug(f"CGEventTapIsEnabled failed: {e}")
+                        if not enabled:
+                            try:
+                                _wd_quartz.CGEventTapEnable(tap, True)
+                                print(
+                                    "⚠ CGEventTap was disabled — re-enabled by watchdog",
+                                    flush=True,
+                                )
+                            except Exception as e:
+                                logging.error(f"watchdog tap re-enable failed: {e}")
+                            # В момент отключения могла идти запись — on_release
+                            # точно потерян, останавливаем её.
+                            if state.is_recording:
+                                action_queue.put("stop")
+                            # Дали tap'у ожить; listener не пересоздаём.
+                            continue
+
+                # (C) thread-liveness
+                try:
+                    alive = lst.is_alive() and getattr(lst, "running", True)
+                except Exception:
+                    alive = False
+                if alive:
+                    continue
+                print("⚠ pynput listener thread died, recreating...", flush=True)
+                try:
+                    lst.stop()
+                except Exception:
+                    pass
+                try:
+                    new_lst = _build_listener()
+                    new_lst.start()
+                    listener_holder["listener"] = new_lst
+                except Exception as e:
+                    logging.error(f"listener recreate failed: {e}")
+
+        threading.Thread(target=_listener_watchdog, daemon=True, name="listener-watchdog").start()
+
+        listener = _build_listener()
+        listener_holder["listener"] = listener
+        try:
+            listener.start()
+            listener.join()
+        except KeyboardInterrupt:
+            try: listener.stop()
+            except Exception: pass
     else:
         # Toggle: нажал → старт, нажал ещё раз → стоп
+        _patch_pynput_macos_stability()  # тот же tap-recovery нужен и в toggle
         with keyboard.GlobalHotKeys({hotkey_str: toggle}) as listener:
             try:
                 listener.join()

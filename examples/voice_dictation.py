@@ -56,7 +56,10 @@ DEFAULT_CONFIG = {
     "sample_rate": 16000,
     "channels": 1,
     "auto_paste": True,                  # вставить через Cmd+V/Ctrl+V после копирования
-    "play_sound": True,                  # бипы на старт/стоп
+    "paste_mode": "paste",               # macOS: "paste" = мгновенный Cmd+V из буфера; "type" = посимвольно (для webview/iframe куда Cmd+V не доходит)
+    "play_sound": True,                  # звук на старт/стоп
+    "sound_theme": "glass",              # macOS: glass | subtle | scifi | synth
+    "sound_volume": 0.5,                 # macOS afplay -v (0.0–1.0)
     "show_tray": True,                   # значок в трее (если установлен pystray)
     "show_cursor_indicator": True,       # мигающая красная точка у курсора во время записи
     "cursor_indicator_color": "#ef4444", # цвет точки (CSS hex)
@@ -239,6 +242,12 @@ class AudioRecorder:
         self._frames: list = []
         self._stream = None
         self._recording = False
+        # CoreAudio периодически дедлочит на stream.stop() (HAL-мьютекс, после
+        # смены устройства / сна Mac). stop() закрывает поток в отдельном треде
+        # с таймаутом; если не уложился — ставит stop_deadlocked и вызывающий
+        # код перезапускает процесс (restart_self) для чистого CoreAudio.
+        self.stop_deadlocked = False
+        self.stop_timeout_sec = 4.0
 
     def start(self) -> None:
         import sounddevice as sd
@@ -261,15 +270,44 @@ class AudioRecorder:
         self._stream.start()
 
     def stop(self) -> Optional[str]:
-        """Остановить запись и сохранить в WAV. Вернуть путь к файлу."""
+        """Остановить запись и сохранить в WAV. Вернуть путь к файлу.
+
+        Аудио-кадры уже накоплены в callback'е, поэтому сам факт остановки
+        потока для транскрипции не нужен — он только закрывает микрофон.
+        PortAudio/CoreAudio изредка дедлочит на stream.stop() (вечный
+        __psynch_mutexwait в HALB_Mutex::Lock, наблюдалось после смены
+        аудиоустройства / сна Mac), и раньше это морозило весь хоткей-цикл.
+        Теперь закрываем поток в отдельном демон-треде с таймаутом: если
+        CoreAudio завис — тред бросаем (поток утёк, но процесс жив), ставим
+        stop_deadlocked и всё равно сохраняем WAV; вызывающий код после
+        транскрипции делает restart_self() для чистого CoreAudio-клиента.
+        """
         import numpy as np
         import soundfile as sf
 
         if not self._recording or not self._stream:
             return None
         self._recording = False
-        self._stream.stop()
-        self._stream.close()
+
+        stream = self._stream
+        self.stop_deadlocked = False
+
+        def _close():
+            try:
+                stream.stop()
+                stream.close()
+            except Exception as e:
+                logging.warning(f"audio stream close error: {e}")
+
+        closer = threading.Thread(target=_close, daemon=True, name="pa-stream-close")
+        closer.start()
+        closer.join(timeout=self.stop_timeout_sec)
+        if closer.is_alive():
+            logging.error(
+                "PortAudio stop() deadlocked on CoreAudio HAL mutex — abandoning "
+                "stream; process will self-restart after this dictation"
+            )
+            self.stop_deadlocked = True
         self._stream = None
 
         if not self._frames:
@@ -542,6 +580,22 @@ def _macos_type_unicode(text: str) -> None:
     print(f"⌨  Typed {n} chars in {time.time()-t0:.2f}s", flush=True)
 
 
+def _macos_cmd_v_cgevent() -> None:
+    """Cmd+V через Quartz CGEvent (virtual keycode 9 = 'v'). Мгновенно и не
+    зависит от длины текста — в отличие от посимвольного _macos_type_unicode,
+    который приложение отрисовывает по букве. Надёжнее osascript System Events.
+    Текст должен уже лежать в clipboard. Флаги выставляем явно (только Command),
+    чтобы «залипший» shift/alt не превратил Cmd+V в Cmd+Shift+V."""
+    import Quartz
+    V_KEYCODE = 9  # kVK_ANSI_V
+    down = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, True)
+    Quartz.CGEventSetFlags(down, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+    up = Quartz.CGEventCreateKeyboardEvent(None, V_KEYCODE, False)
+    Quartz.CGEventSetFlags(up, Quartz.kCGEventFlagMaskCommand)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+
+
 def paste_from_clipboard(text: Optional[str] = None) -> None:
     """Симулировать Cmd+V (Mac) или Ctrl+V (Linux/Win).
 
@@ -574,7 +628,9 @@ def paste_from_clipboard(text: Optional[str] = None) -> None:
         except Exception as _e:
             logging.debug(f"modifier release skipped: {_e}")
 
-        # Путь 1: прямой Quartz CGEvent UnicodeString — независим от раскладки.
+        # Посимвольный ввод через Quartz UnicodeString — только когда передан
+        # text (paste_mode="type"): для редких webview/iframe, куда Cmd+V не
+        # доходит. Медленно на длинных текстах — приложение печатает по букве.
         if text is not None:
             try:
                 _macos_type_unicode(text)
@@ -589,6 +645,14 @@ def paste_from_clipboard(text: Optional[str] = None) -> None:
                     return
                 except Exception as e2:
                     logging.warning(f"pynput type() also failed: {e2}, fallback to Cmd+V")
+
+        # Дефолт: мгновенный Cmd+V из буфера через Quartz CGEvent (не зависит
+        # от длины текста). osascript/pynput ниже — fallback'и.
+        try:
+            _macos_cmd_v_cgevent()
+            return
+        except Exception as e:
+            logging.warning(f"Quartz Cmd+V failed: {e}, trying osascript")
 
         try:
             subprocess.run(
@@ -747,14 +811,70 @@ def _play_wav_bytes(wav: bytes) -> None:
             logging.error(f"winsound play failed: {e}")
 
 
+# ─── macOS sound themes (afplay) ──────────────────────────────────────────────
+# На macOS winsound нет, а вывод через sounddevice конфликтует с активным
+# InputStream записи (история дедлоков PortAudio). Поэтому системные звуки
+# играем через afplay — отдельный процесс, PortAudio не трогает. Темы маппятся
+# на /System/Library/Sounds/*.aiff. theme="synth"/неизвестная → тоновый fallback.
+
+_MAC_SOUND_THEMES = {
+    "glass":  ("Glass", "Bottle"),
+    "subtle": ("Tink", "Pop"),
+    "scifi":  ("Submarine", "Hero"),
+}
+_MAC_SYS_SOUNDS = Path("/System/Library/Sounds")
+
+_MAC_SOUND_START: Optional[str] = None  # путь к .aiff старта или None → synth
+_MAC_SOUND_STOP: Optional[str] = None
+_MAC_SOUND_VOL: str = "0.5"
+
+
+def configure_sounds(cfg: dict) -> None:
+    """Подготовить пути звуковой темы (один раз на старте). Только macOS —
+    на Windows работает предрендеренный winsound-WAV, на Linux — тоны play_beep."""
+    global _MAC_SOUND_START, _MAC_SOUND_STOP, _MAC_SOUND_VOL
+    if platform.system() != "Darwin":
+        return
+    _MAC_SOUND_VOL = str(cfg.get("sound_volume", 0.5))
+    pair = _MAC_SOUND_THEMES.get((cfg.get("sound_theme") or "glass").lower())
+    if not pair:
+        _MAC_SOUND_START = _MAC_SOUND_STOP = None  # synth fallback
+        return
+    start = _MAC_SYS_SOUNDS / f"{pair[0]}.aiff"
+    stop = _MAC_SYS_SOUNDS / f"{pair[1]}.aiff"
+    _MAC_SOUND_START = str(start) if start.exists() else None
+    _MAC_SOUND_STOP = str(stop) if stop.exists() else None
+
+
+def _afplay(path: str) -> None:
+    """Fire-and-forget проигрывание .aiff/.wav через системный afplay."""
+    try:
+        subprocess.Popen(
+            ["afplay", "-v", _MAC_SOUND_VOL, path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        logging.error(f"afplay failed: {e}")
+
+
 def play_start_beep() -> None:
+    if platform.system() == "Darwin":
+        _afplay(_MAC_SOUND_START) if _MAC_SOUND_START else play_dual_beep(700, 900)
+        return
     if _BEEP_WAV_START is not None:
-        _play_wav_bytes(_BEEP_WAV_START)
+        _play_wav_bytes(_BEEP_WAV_START)   # Windows
+    else:
+        play_dual_beep(700, 900)           # Linux / прочее — synth fallback
 
 
 def play_stop_beep() -> None:
+    if platform.system() == "Darwin":
+        _afplay(_MAC_SOUND_STOP) if _MAC_SOUND_STOP else play_beep(600, 100)
+        return
     if _BEEP_WAV_STOP is not None:
-        _play_wav_bytes(_BEEP_WAV_STOP)
+        _play_wav_bytes(_BEEP_WAV_STOP)    # Windows
+    else:
+        play_beep(600, 100)                # Linux / прочее — synth fallback
 
 
 def play_dual_beep(f1: int, f2: int, dur_ms: int = 60, gap_ms: int = 40) -> None:
@@ -1139,10 +1259,21 @@ def main_loop(cfg: dict, cfg_path: Path):
         wav_path = recorder.stop()
         if cfg.get("play_sound"):
             threading.Thread(target=play_stop_beep, daemon=True).start()
+
+        def _restart_if_deadlocked() -> None:
+            # CoreAudio завис на stop(): поток утёк, следующий InputStream.start()
+            # тоже зависнет — поэтому поднимаем свежий процесс. restart_self()
+            # делает os._exit, так что код после него не исполняется.
+            if getattr(recorder, "stop_deadlocked", False):
+                print("♻  Аудио-движок CoreAudio завис на остановке — перезапускаю диктовку…")
+                logging.error("self-restart to recover from PortAudio/CoreAudio stop deadlock")
+                restart_self()
+
         if not wav_path:
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
+            _restart_if_deadlocked()
             return
         duration_ms = recorder.duration_sec * 1000
 
@@ -1153,6 +1284,7 @@ def main_loop(cfg: dict, cfg_path: Path):
             tray.set_state("idle")
             if cursor_ind:
                 cursor_ind.hide()
+            _restart_if_deadlocked()
             return
 
         print(f"⏳ Transcribing {duration_ms:.0f}ms of audio...")
@@ -1189,13 +1321,18 @@ def main_loop(cfg: dict, cfg_path: Path):
                         text_to_paste = text
 
                     if cfg.get("auto_paste") and platform.system() == "Darwin":
-                        # На macOS печатаем напрямую — работает в Electron-webview
-                        # (VS Code/Cursor chat, Slack, Discord, web-ChatGPT/Claude),
-                        # где Cmd+V из System Events часто молча игнорируется.
-                        # Clipboard не трогаем — он остаётся пользовательским.
-                        copy_to_clipboard(text_to_paste)  # на всякий случай — если паст не дойдёт, можно руками
+                        # Текст всегда в clipboard: и как источник для Cmd+V,
+                        # и как fallback «вставить руками», если паст не дойдёт.
+                        copy_to_clipboard(text_to_paste)
                         time.sleep(0.05)
-                        paste_from_clipboard(text=text_to_paste)
+                        if cfg.get("paste_mode", "paste") == "type":
+                            # Посимвольный ввод — для Electron-webview/iframe
+                            # (VS Code/Cursor chat, web-ChatGPT/Claude), куда
+                            # Cmd+V не доходит. Медленно на длинных текстах.
+                            paste_from_clipboard(text=text_to_paste)
+                        else:
+                            # Дефолт: мгновенный Cmd+V, от длины не зависит.
+                            paste_from_clipboard()
                     else:
                         saved_clipboard = save_clipboard() if cfg.get("auto_paste") else None
                         copy_to_clipboard(text_to_paste)
@@ -1207,6 +1344,13 @@ def main_loop(cfg: dict, cfg_path: Path):
             except Exception as e:
                 print(f"❌ Transcription failed: {e}")
             finally:
+                # Если stop() дедлокнул, перезапускаемся ПОКА is_transcribing=True —
+                # тогда хоткей не сможет стартовать новую запись в заклиненный
+                # CoreAudio до того, как поднимется свежий процесс.
+                if getattr(recorder, "stop_deadlocked", False):
+                    try: os.unlink(wav_path)
+                    except: pass
+                    _restart_if_deadlocked()  # os._exit — ниже код не идёт
                 state.is_transcribing = False
                 tray.set_state("idle")
                 if cursor_ind:
@@ -1267,15 +1411,15 @@ def main_loop(cfg: dict, cfg_path: Path):
         _patch_pynput_macos_stability(on_recovery=_on_tap_recovery)
 
         def on_press(key):
-            ck = _canonical_key(key)
-            currently_pressed.add(ck)
+            names = _canonical_key(key)
+            currently_pressed.update(names)
             if keys_needed.issubset(currently_pressed) and not state.is_recording:
                 action_queue.put("start")
 
         def on_release(key):
-            ck = _canonical_key(key)
-            was_active_combo = ck in keys_needed and state.is_recording
-            currently_pressed.discard(ck)
+            names = _canonical_key(key)
+            was_active_combo = bool(names & keys_needed) and state.is_recording
+            currently_pressed.difference_update(names)
             if was_active_combo:
                 action_queue.put("stop")
 
@@ -1424,22 +1568,28 @@ def _parse_hotkey(s: str) -> set:
     return keys
 
 
-def _canonical_key(key) -> str:
-    """Канонизирует key из pynput в строку, совпадающую с _parse_hotkey."""
+def _canonical_key(key) -> set:
+    """Имена нажатой клавиши для матчинга с _parse_hotkey.
+
+    Возвращает МНОЖЕСТВО: и side-specific ('cmd_r'), и generic ('cmd'). Так
+    хоткей может требовать конкретную сторону (<cmd_r> → только правый Command,
+    левый ⌘C/⌘V диктовку не триггерит) ИЛИ любую (<ctrl> → любой Control).
+    Без generic-формы сломался бы старый дефолт <ctrl>+<shift>+<space>; без
+    side-specific не работают <cmd_r>/<alt_r> (был баг: _parse_hotkey сохранял
+    сторону, _canonical_key её срезал → пустое пересечение, запись не стартовала)."""
     from pynput.keyboard import Key, KeyCode
     if isinstance(key, Key):
-        # Key.ctrl_l, Key.shift_r → "ctrl", "shift"
-        name = key.name
-        # Убрать суффиксы _l/_r
+        name = key.name                      # 'cmd_r', 'ctrl_l', 'space', ...
+        names = {name}
         for suffix in ("_l", "_r"):
             if name.endswith(suffix):
-                name = name[:-2]
-        return name
+                names.add(name[:-2])         # generic: 'cmd', 'ctrl', 'shift', 'alt'
+        return names
     if isinstance(key, KeyCode):
         if key.char:
-            return key.char.lower()
-        return str(key)
-    return str(key).lower()
+            return {key.char.lower()}
+        return {str(key)}
+    return {str(key).lower()}
 
 
 # ─── Entry point ────────────────────────────────────────────────────────────
@@ -1493,6 +1643,7 @@ def main():
 
     cfg_path = Path(args.config) if args.config else default_config_path()
     cfg = load_config(cfg_path)
+    configure_sounds(cfg)
 
     if cfg.get("log_file"):
         _attach_log_file(cfg["log_file"], args.verbose)

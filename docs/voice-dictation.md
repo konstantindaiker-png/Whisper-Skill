@@ -48,6 +48,8 @@ python -m examples.voice_dictation
   "max_duration_sec": 60,
   "auto_paste": true,
   "play_sound": true,
+  "sound_theme": "glass",
+  "sound_volume": 0.5,
   "show_tray": true,
   "trim_silence_ms": 200,
   "min_duration_ms": 300
@@ -63,7 +65,10 @@ python -m examples.voice_dictation
 | `language` | `null` / `ru` / `en` / ... | `null` — auto-detect (медленнее). Лучше указать |
 | `model` | имя | `large-v3-turbo` (дефолт), `large-v3`, `medium`, `small`, `tiny` |
 | `auto_paste` | bool | После транскрибации эмулировать Cmd+V/Ctrl+V. Если `false` — только в clipboard |
-| `play_sound` | bool | Тихие бипы на старт/стоп для обратной связи |
+| `paste_mode` | `paste` / `type` | **macOS**. `paste` (дефолт) — мгновенный Cmd+V из буфера, не зависит от длины текста. `type` — посимвольный ввод через CGEvent (медленно на длинных текстах, но доходит в webview/iframe где Cmd+V игнорируется: VS Code/Cursor chat, web-ChatGPT/Claude) |
+| `play_sound` | bool | Звук на старт/стоп для обратной связи |
+| `sound_theme` | строка | **macOS** — звуковая тема (через `afplay`): `glass` (Glass→Bottle), `subtle` (Tink→Pop), `scifi` (Submarine→Hero), `synth` (синтез-тоны). Windows играет предрендеренный WAV независимо от темы |
+| `sound_volume` | float | **macOS** — громкость `afplay` (0.0–1.0) |
 | `show_tray` | bool | Иконка в трее (меняет цвет: серый/красный/оранжевый) |
 | `min_duration_ms` | int | Игнорировать короткие записи (промахи кнопкой) |
 

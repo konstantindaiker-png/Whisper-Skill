@@ -87,3 +87,39 @@ PTT-диктовка стартует сама при логине через la
 - Где применено: `board/transcribe_audio.py` (файловая транскрибация планёрок) переведён на turbo 2026-06-15. Диктовка (свой backend) - отдельно.
 - Для коротких клипов/Reels - mlx turbo ок, циклы редки. Хочешь ещё быстрее на час аудио - mlx turbo на GPU M4, но нужен Silero-VAD пречанкинг руками.
 - Модель `Systran/faster-whisper-large-v3` (CTranslate2) - отдельный файл от mlx-версии, в `~/.cache/huggingface/hub/`. Качается ~3 GB; при регулярном использовании поставить `HF_TOKEN`.
+
+---
+
+## Заметки из проекта AI Restohub
+
+### Висяк диктовки (PortAudio stop deadlock)
+
+Konstantin's push-to-talk voice dictation (whisper-skill `examples.voice_dictation`, hotkey Ctrl+Shift+Space) occasionally hangs ("виспер завис"). Root cause (confirmed via `sample` 2026-06-05 and 2026-06-06): **PortAudio deadlock on stream stop**, NOT transcription. Main thread is stuck in `_stream.stop()` → `FinishStoppingStream` (libportaudio) → `AudioOutputUnitStop` (CoreAudio) → `HALB_Mutex::Lock()` → `__psynch_mutexwait` (вечный mutex). Triggered by audio-device change on the fly (Mac sleep/wake, Bluetooth, sample-rate change), esp. after long uptime.
+
+KEY GOTCHA (why a naive restart "не помогает"): the process does **not die** — it stays alive but wedged (`STAT S`, blocked in kernel). So `voice_dictation.lock` stays valid and a relaunch silently refuses ("already running"). Also: `grep dictate` MISSES it — the process is `voice_dictation` (no "e"). Use `pgrep -f examples.voice_dictation`.
+
+Diagnose: `pgrep -f examples.voice_dictation`; if a PID exists but hotkey is dead, it's wedged. Confirm with `sample <pid> 1` — leaf in `libportaudio`/`CoreAudio`/`HALB_Mutex` = the stop deadlock. SIGTERM is ignored (stuck in C call) → need `kill -9`.
+
+Manual restart (if needed):
+1. `pkill -9 -f "examples.voice_dictation"` (do NOT grep "dictate")
+2. `rm -f ~/.config/whisper-skill/voice_dictation.lock`
+3. `cd ~/.claude/skills/whisper-skill && nohup ./dictate.sh > /tmp/dictate_restart.log 2>&1 & disown`
+4. verify: `pgrep -f examples.voice_dictation` + `tail ~/.config/whisper-skill/voice_dictation.log`.
+
+FIX IMPLEMENTED 2026-06-06 (in `examples/voice_dictation.py`, repo github.com/Mobiss11/Whisper-Skill, NOT yet pushed — local main was ahead 2): `AudioRecorder.stop()` now closes the stream in a daemon thread with `stop_timeout_sec=4.0`; on timeout it sets `stop_deadlocked`, abandons the leaked stream, still saves the WAV (frames already captured in callback). `stop_and_transcribe`/`work()` then call `restart_self()` after transcription → clean process, no more permanent freeze. So the hang now self-heals; manual `kill -9` should rarely be needed. Backups: `examples/voice_dictation.py.bak-fix-*`.
+
+`matmul divide-by-zero/overflow` warnings in the log are benign (empty/short audio at warm-up). See [[whisper-skill]] / [[project-ai-restohub]].
+
+---
+
+### MLX-бэкенд на Apple Silicon (Metal вместо CPU)
+
+faster-whisper (CTranslate2) **не поддерживает Metal** → на маке считает только на CPU. Whisper энкодит фиксированное 30-секундное окно на каждый вызов, поэтому на CPU M4 получается ~3.5-4с фиксированной задержки на любую, даже 1.5-секундную, диктовку.
+
+mlx-whisper использует Metal-GPU. Замер на M4/16GB, аудио 6.5с русской речи, та же модель large-v3-turbo, качество идентичное: **faster 4.9с → mlx 2.0с (2.5x)**.
+
+Конфиг `~/.config/whisper-skill/voice_dictation.json` был ошибочно на `"backend": "faster"` — исправлено на `"mlx"` (2026-06-09). mlx-модель `mlx-community/whisper-large-v3-turbo` уже в кеше HF. Если перф диктовки снова просядет — первым делом проверять, что backend=mlx, а не faster/cpp.
+
+Связано: [[whisper-dictation-hang-fix]]. Текущая раскладка Константина — правый Cmd (PTT), звук glass, вставка мгновенным Cmd+V (`paste_mode: paste`).
+
+**Запуск — только вручную (`./dictate.sh`), НЕ через launchd (2026-06-09).** Пробовали LaunchAgent — провал: launchd-процессу macOS не отдаёт **ни Accessibility, ни Микрофон** (оба TCC-разрешения привязаны к responsible-процессу, у фонового агента его нет). Accessibility ещё добавляется вручную (в панели есть «+»), а **Микрофон — нет** (у панели Микрофон нет кнопки «+», приложение попадает туда только по системному запросу, который у фонового агента не всплывает). Симптом немого микрофона: запись правильной длины, но Whisper выдаёт галлюцинацию **«Продолжение следует...»** (рус. аналог "Thank you for watching" на тишине). LaunchAgent удалён. Ручной запуск из терминала работает, т.к. наследует TCC от терминала. Если КОГДА-ТО понадобится настоящий автозапуск — заворачивать в подписанный/AppleScript `.app` + «Объекты входа» (тогда .app сам штатно запросит микрофон и accessibility, грант привязан к стабильному .app). Все фиксы закоммичены: `Mobiss11/Whisper-Skill`, main, коммит fa4eaf1.
